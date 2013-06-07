@@ -8,25 +8,22 @@
   "create a cachedb collection."
   [keys indexes]
   {:pre [(every? keyword? keys)
-         (every? #(every? (set keys) %) indexes)]}
-  (let [idx-map (reduce #(assoc %1 (set %2) {}) {} indexes)
+         (every? keyword? indexes)]}
+  (let [idx-map (reduce #(assoc %1 %2 (sorted-map)) {} indexes)
         keys (if (not-any? (partial = :id) keys)
                (concat [:id] keys)
                keys)]
     {:keys keys, :idx idx-map, :data {}}))
 
-(defn- update-index [coll f doc]
-  (loop [[[idx-key idx-data] & more-idxes] (seq (:idx coll)), coll coll]
-        (if idx-key
-          (let [coll (update-in coll [:idx idx-key (select-keys doc idx-key)] #(if (nil? %1) [%2] (f %1 %2)) doc)]
-            (if (seq more-idxes)
-              (recur more-idxes coll)
-              coll))
-          coll)))
+(defn- update-index [coll f condition ids]
+  (letfn [(init-idx-if-need [idx-data f ids]
+            (apply f (or idx-data #{}) ids))]
+    (reduce #(update-in %1 [:idx %2 (get condition %2)] init-idx-if-need f ids)
+            coll (-> (:idx coll) (keys)))))
 
 (defn- insert-doc [coll {:keys [id] :as doc}]
   (-> (assoc-in coll [:data id] doc)
-      (update-index conj doc)))
+      (update-index conj doc [(:id doc)])))
 
 (defn insert [coll doc]
   {:pre [(validate-keys? coll (keys doc))]}
@@ -36,52 +33,44 @@
     (->> (assoc doc :id (ObjectId.))
          (insert-doc coll))))
 
-(def user (collection [:a :b :c] [[:a] [:b]]))
-
-(identity user)
-
-(time (-> user
-          (insert {:a 1 :b 2 :c 3})
-          (insert {:a 1 :b 1 :c 4})
-          (insert {:a 2 :b 1 :c 3})))
-
-(defn- get-index [coll condition]
-  (let [cond-keys-set (-> (keys condition) (set))]
-    (get-in coll [:idx cond-keys-set])))
-
-(defn- get-ids-from-indexes [coll condition]
-  (-> (get-index coll condition)
-      (get condition)
-      (map :id)
-      (seq)))
-
-(defn- get-ids-from-data [coll condition]
-  ;; TODO 从数据集中提取id
-  )
-
-(defn- get-doc-ids [coll condition]
-  (or (get-ids-from-indexes coll condition)
-      (get-ids-from-data coll condition)))
+(defn- use-index? [{:keys [idx] :as coll} condition]
+  (every? (-> (keys idx) (set)) (keys condition)))
 
 (defn update [coll condition doc]
   {:pre [(validate-keys? coll (keys doc))
          (not (contains? doc :id))]}
-  (if-let [ids (get-doc-ids coll condition)]
-    ;; TODO
-    ))
+  (if-let [ids (cond
+                (contains? condition :id) [(:id condition)]
+                (use-index? coll condition) (->> (keys condition)
+                                                 (map #(get-in coll [:idx % (get condition %)]))
+                                                 (apply clojure.set/intersection))
+                :else (->> (filter #(every? (fn [[k v]] (= (k %) v)) condition) (-> (:data coll) (vals)))
+                           (map :id)))]
+    (let [doc-keys (keys doc)
+          old-docs (reduce (fn [docs id]
+                             (->> (-> (get (:data coll) id)
+                                      (select-keys doc-keys))
+                                  (conj docs)))
+                           [] ids)]
+      (-> (reduce #(update-in %1 [:data %2] merge doc) coll ids)
+          ((fn [coll]
+             (reduce #(update-index %1 disj %2 ids) coll old-docs)))
+          (update-index conj doc ids)))
+    coll))
+
+(def user (collection [:a :b :c] [:a :b]))
+(-> user
+    (insert {:id 1 :a 1 :b 2 :c 3})
+    (insert {:id 2 :a 1 :b 1 :c 4})
+    (insert {:id 3 :a 2 :b 1 :c 3})
+    (update {:c 3} {:a 3 :b 3 :c 5})
+    )
 
 (defn upsert [coll condition doc]
   {:pre [(validate-keys? coll (keys doc))
          (not-every? #(contains? % :id) [condition doc])]}
   ;; TODO
   )
-
-(defcoll users [:name :age :address] [[:name] [:age]])
-
-(dosync
- (insert users {:id 5 :name "bbb" :age 1}))
-
-(clojure.pprint/pprint (deref users))
 
 (comment
   ;; TODO 根据新结构重新实现
